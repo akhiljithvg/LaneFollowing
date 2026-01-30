@@ -94,7 +94,7 @@ upper_red2 = np.array([180, 255, 255])
 kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5,5))
 
 # Video capture
-cap = cv2.VideoCapture(0)
+cap = cv2.VideoCapture(1)
 cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
 cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
 time.sleep(0.3)

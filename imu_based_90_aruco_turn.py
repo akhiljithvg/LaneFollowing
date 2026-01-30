@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 import os
-os.environ["QT_QPA_PLATFORM"] = "xcb"  # Force X11 for monitor
 import cv2
 import numpy as np
 import RPi.GPIO as GPIO
@@ -18,7 +17,7 @@ try:
     print("MPU6050 Initialized.")
 except Exception as e:
     print(f"Error initializing MPU6050: {e}")
-    exit(1)
+    mpu = None
 
 MOTOR_LEFT_FORWARD  = 16
 MOTOR_LEFT_BACKWARD = 12
@@ -59,6 +58,7 @@ def stop_motor():
     set_motor(0, 0)
 
 def calibrate_gyro(samples=100):
+    if mpu is None: return 0.0
     print("Calibrating Gyro... Keep robot still!")
     stop_motor()
     offset = 0.0
@@ -67,17 +67,26 @@ def calibrate_gyro(samples=100):
         time.sleep(0.01)
     return offset / samples
 
-def turn_robot(target_angle, turn_speed=45):
-    """Turns robot exactly X degrees using Gyro integration"""
-    print(f"--- Gyro Turn: {target_angle} deg ---")
+def turn_robot(target_angle):
+    """
+    Turns robot X degrees using a smooth 'Ackermann' style arc.
+    """
+    if mpu is None:
+        return
+
+    print(f"--- Smooth Turn: {target_angle} deg ---")
+    
+    # SPEEDS FOR SMOOTH TURN
+    OUTER_SPEED = 25 
+    INNER_SPEED = 5
+    
     current_angle = 0.0
     last_time = time.time()
     
-    # Start turning
     if target_angle > 0:
-        set_motor(-turn_speed, turn_speed) # Left
+        set_motor(INNER_SPEED, OUTER_SPEED) # Left
     else:
-        set_motor(turn_speed, -turn_speed) # Right
+        set_motor(OUTER_SPEED, INNER_SPEED) # Right
         
     while True:
         now = time.time()
@@ -88,47 +97,48 @@ def turn_robot(target_angle, turn_speed=45):
         gyro_z = (mpu.gyro[2] - GYRO_OFFSET) * 57.2958
         current_angle += gyro_z * dt
         
-        # Check completion
         if target_angle > 0 and current_angle >= target_angle: break
         if target_angle < 0 and current_angle <= target_angle: break
         
     stop_motor()
-    time.sleep(0.2) # Settle
+    time.sleep(0.2) 
 
 # ============================================================
-#   VISION PARAMS (Restored from First Script)
+#   VISION PARAMS
 # ============================================================
 FRAME_WIDTH  = 320
 FRAME_HEIGHT = 240
 
-# Tuning Params
-MAX_SPEED    = 35
-BASE_SPEED   = int(MAX_SPEED * 0.6)
-STEER_GAIN   = 0.12  # Sensitivity
-NWINDOWS     = 10    # Number of sliding windows
-MARGIN       = 40    # Width of sliding window
-MINPIX       = 40    # Min pixels to recenter window
+MAX_SPEED    = 15
+BASE_SPEED   = int(MAX_SPEED * 1)
+STEER_GAIN   = 0.12  
+NWINDOWS     = 10    
+MARGIN       = 40    
+MINPIX       = 40    
 
-# Color Ranges (Red)
 lower_red1 = np.array([0, 110, 70])
 upper_red1 = np.array([8, 255, 255])
 lower_red2 = np.array([165, 110, 70])
 upper_red2 = np.array([180, 255, 255])
 kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,(5,5))
 
-# Perspective Transform
 WARP_SRC = np.float32([[40, 95], [280, 95], [0, FRAME_HEIGHT-8], [FRAME_WIDTH-1, FRAME_HEIGHT-8]])
 WARP_DST = np.float32([[60, 0], [FRAME_WIDTH-60, 0], [60, FRAME_HEIGHT], [FRAME_WIDTH-60, FRAME_HEIGHT]])
 M_warp = cv2.getPerspectiveTransform(WARP_SRC, WARP_DST)
 Minv   = cv2.getPerspectiveTransform(WARP_DST, WARP_SRC)
 
-# ArUco
+# --- ARUCO SETUP ---
 ARUCO_DICT = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
 ARUCO_PARAMS = cv2.aruco.DetectorParameters()
-# NOTE: If you are on new OpenCV, uncomment the line below:
-# aruco_detector = cv2.aruco.ArucoDetector(ARUCO_DICT, ARUCO_PARAMS)
+ARUCO_PARAMS.minMarkerPerimeterRate = 0.02 
 
-TAG_MAP = {1: "STOP", 2: "RIGHT", 3: "LEFT"}
+try:
+    aruco_detector = cv2.aruco.ArucoDetector(ARUCO_DICT, ARUCO_PARAMS)
+    OLD_ARUCO = False
+except AttributeError:
+    OLD_ARUCO = True
+
+TAG_MAP = {1: "STOP", 6: "LEFT", 8: "RIGHT"}
 
 # ============================================================
 #   MAIN LOOP
@@ -142,6 +152,10 @@ cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
 cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
 time.sleep(0.3)
 
+# --- COOLDOWN VARIABLES ---
+last_turn_time = 0
+TURN_COOLDOWN = 4.0 # Seconds to ignore ArUco after a turn
+
 print("Starting Loop...")
 
 try:
@@ -151,67 +165,98 @@ try:
         
         frame = cv2.resize(frame, (FRAME_WIDTH, FRAME_HEIGHT))
         
-        # 1. CHECK ARUCO
-        # If using old OpenCV (likely on Pi):
-        corners, ids, _ = cv2.aruco.detectMarkers(frame, ARUCO_DICT, parameters=ARUCO_PARAMS)
-        # If using new OpenCV 4.7+, use: corners, ids, _ = aruco_detector.detectMarkers(frame)
+        # Gyro Data for HUD
+        gyro_z_deg = 0.0
+        if mpu:
+            gyro_z_deg = (mpu.gyro[2] - GYRO_OFFSET) * 57.2958
 
+        # ==========================================
+        # 1. CHECK ARUCO (WITH COOLDOWN TIMER)
+        # ==========================================
         action = None
-        if ids is not None:
-            tid = ids[0][0]
-            if tid in TAG_MAP:
-                action = TAG_MAP[tid]
-                print(f"Junction: {action}")
+        
+        # Only check for tags if the cooldown time has passed
+        if (time.time() - last_turn_time) > TURN_COOLDOWN:
+            
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            if OLD_ARUCO:
+                 corners, ids, _ = cv2.aruco.detectMarkers(gray, ARUCO_DICT, parameters=ARUCO_PARAMS)
+            else:
+                 corners, ids, _ = aruco_detector.detectMarkers(gray)
+            
+            if ids is not None:
+                cv2.aruco.drawDetectedMarkers(frame, corners, ids)
+                for i in range(len(ids)):
+                    tid = ids[i][0]
+                    if tid in TAG_MAP:
+                        action = TAG_MAP[tid]
+                        print(f"Detected Tag {tid}: {action}")
+                        break 
+        else:
+            # OPTIONAL: Visual indicator that we are in cooldown
+            cv2.putText(frame, "COOLDOWN MODE", (10, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,255), 2)
 
+        # --- EXECUTE ACTION ---
         if action == "STOP":
             stop_motor()
             time.sleep(2.0)
-            set_motor(BASE_SPEED, BASE_SPEED) # Drive past tag
-            time.sleep(0.5)
+            set_motor(BASE_SPEED, BASE_SPEED) 
+            time.sleep(1.0) 
+            last_turn_time = time.time() # Start cooldown
 
         elif action == "LEFT":
-            set_motor(BASE_SPEED, BASE_SPEED) # Drive into center
-            time.sleep(0.4) 
+            print("Executing Left Turn...")
+            set_motor(BASE_SPEED, BASE_SPEED)
+            time.sleep(0.5) 
             stop_motor()
-            turn_robot(90) # Gyro Turn
+            turn_robot(90)  
+            
+            # Drive forward to physically clear the tag
+            set_motor(BASE_SPEED, BASE_SPEED)
+            time.sleep(0.8) 
+            
+            last_turn_time = time.time() # START COOLDOWN TIMER
 
         elif action == "RIGHT":
+            print("Executing Right Turn...")
             set_motor(BASE_SPEED, BASE_SPEED)
-            time.sleep(0.4)
+            time.sleep(0.5)
             stop_motor()
-            turn_robot(-90) # Gyro Turn
+            turn_robot(-90) 
+            
+            # Drive forward to physically clear the tag
+            set_motor(BASE_SPEED, BASE_SPEED)
+            time.sleep(0.8)
+            
+            last_turn_time = time.time() # START COOLDOWN TIMER
 
         else:
-            # 2. LANE FOLLOWING (SLIDING WINDOW RESTORED)
+            # 2. LANE FOLLOWING
             hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
             mask = cv2.bitwise_or(cv2.inRange(hsv, lower_red1, upper_red1), 
                                   cv2.inRange(hsv, lower_red2, upper_red2))
-            # Remove dark noise
             mask[hsv[:,:,2] < 40] = 0 
             mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
             
             warped = cv2.warpPerspective(mask, M_warp, (FRAME_WIDTH, FRAME_HEIGHT))
 
-            # Histogram to find start of lane
             bottom_half = warped[FRAME_HEIGHT//2:, :]
             col_counts = np.sum(bottom_half // 255, axis=0)
             max_val = np.max(col_counts)
 
+            steer = 0
+            damping = 0
+
             if max_val < 5:
-                # LINE LOST -> Go slow / Straight (or use Gyro heading hold)
                 set_motor(int(BASE_SPEED*0.8), int(BASE_SPEED*0.8))
             else:
-                # Find lane base
                 base_x = np.argmax(col_counts)
-                
-                # Sliding Window Logic
                 nonzero = warped.nonzero()
                 nonzeroy = np.array(nonzero[0])
                 nonzerox = np.array(nonzero[1])
                 
                 current_x = base_x
                 window_height = warped.shape[0] // NWINDOWS
-                
                 lane_inds = []
                 
                 for w in range(NWINDOWS):
@@ -219,44 +264,37 @@ try:
                     win_y_high = warped.shape[0] - w * window_height
                     win_x_left = max(0, current_x - MARGIN)
                     win_x_right = min(FRAME_WIDTH, current_x + MARGIN)
-                    
                     good_inds = ((nonzeroy >= win_y_low) & (nonzeroy < win_y_high) & 
                                  (nonzerox >= win_x_left) & (nonzerox < win_x_right)).nonzero()[0]
-                    
                     lane_inds.append(good_inds)
-                    
                     if len(good_inds) > MINPIX:
                         current_x = int(np.mean(nonzerox[good_inds]))
                         
                 lane_inds = np.concatenate(lane_inds)
                 
                 if len(lane_inds) > 0:
-                    # Calculate center of lane pixels
                     lane_center_warp = int(np.mean(nonzerox[lane_inds]))
-                    
-                    # Convert back to real screen coordinates
                     pts = np.array([[[lane_center_warp, FRAME_HEIGHT-10]]], dtype=np.float32)
                     pts_orig = cv2.perspectiveTransform(pts, Minv)
                     lane_x_real = int(pts_orig[0,0,0])
                     
-                    # Steering Logic
+                    cv2.circle(frame, (lane_x_real, FRAME_HEIGHT-10), 5, (0, 255, 0), -1)
+
                     target_x = FRAME_WIDTH // 2
                     error = lane_x_real - target_x
                     
-                    # Proportional Steering
-                    steer = STEER_GAIN * error
+                    raw_steer = STEER_GAIN * error
+                    damping = (0.02 * gyro_z_deg) 
                     
-                    # Optional: Gyro Damping (Prevent oscillation)
-                    gyro_z = (mpu.gyro[2] - GYRO_OFFSET) * 57.3
-                    steer -= (0.02 * gyro_z) 
-                    
+                    steer = raw_steer - damping
                     set_motor(BASE_SPEED - steer, BASE_SPEED + steer)
 
-        # DEBUG DISPLAY (Uncomment if monitor is connected)
-        cv2.imshow("Frame", frame)
-        cv2.imshow("Warp", warped)
-        if cv2.waitKey(1) == ord('q'):
-            break
+        # DEBUG DISPLAY
+        try:
+            cv2.imshow("Robot HUD", frame)
+            if cv2.waitKey(1) == ord('q'): break
+        except Exception:
+            pass
 
 except KeyboardInterrupt:
     print("Stopped by user")

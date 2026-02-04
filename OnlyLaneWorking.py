@@ -1,138 +1,176 @@
+#!/usr/bin/env python3
 import cv2
 import numpy as np
 import RPi.GPIO as GPIO
 import time
 
-# GPIO motor pins (reversed to fix direction issue)
-MOTOR_LEFT_FORWARD = 21
-MOTOR_LEFT_BACKWARD = 20
-MOTOR_RIGHT_FORWARD = 16
-MOTOR_RIGHT_BACKWARD = 12
+# ============================================================
+#    HARDWARE SETUP
+# ============================================================
+MOTOR_LEFT_FORWARD  = 16
+MOTOR_LEFT_BACKWARD = 12
+MOTOR_RIGHT_FORWARD = 21
+MOTOR_RIGHT_BACKWARD= 20
 
 GPIO.setmode(GPIO.BCM)
 GPIO.setwarnings(False)
+for p in [MOTOR_LEFT_FORWARD, MOTOR_LEFT_BACKWARD, MOTOR_RIGHT_FORWARD, MOTOR_RIGHT_BACKWARD]:
+    GPIO.setup(p, GPIO.OUT)
 
-# Setup motor pins
-motor_pins = [MOTOR_LEFT_FORWARD, MOTOR_LEFT_BACKWARD, MOTOR_RIGHT_FORWARD, MOTOR_RIGHT_BACKWARD]
-for pin in motor_pins:
-    GPIO.setup(pin, GPIO.OUT)
+PWM_FREQ = 100
+left_f  = GPIO.PWM(MOTOR_LEFT_FORWARD,  PWM_FREQ)
+left_b  = GPIO.PWM(MOTOR_LEFT_BACKWARD, PWM_FREQ)
+right_f = GPIO.PWM(MOTOR_RIGHT_FORWARD, PWM_FREQ)
+right_b = GPIO.PWM(MOTOR_RIGHT_BACKWARD,PWM_FREQ)
 
-# Create PWM objects at 30 Hz
-left_pwm = GPIO.PWM(MOTOR_LEFT_FORWARD, 30)
-right_pwm = GPIO.PWM(MOTOR_RIGHT_FORWARD, 30)
+for pwm in (left_f, left_b, right_f, right_b):
+    pwm.start(0)
 
-left_pwm.start(0)
-right_pwm.start(0)
+# ============================================================
+#    HELPER FUNCTIONS
+# ============================================================
+def clamp(x, lo=0, hi=100):
+    return max(lo, min(hi, int(x)))
 
-def stop():
-    """Stops both motors by setting their duty cycle to 0 and backward pins to LOW."""
-    left_pwm.ChangeDutyCycle(0)
-    right_pwm.ChangeDutyCycle(0)
-    GPIO.output(MOTOR_LEFT_BACKWARD, GPIO.LOW)
-    GPIO.output(MOTOR_RIGHT_BACKWARD, GPIO.LOW)
+def set_motor(left, right):
+    if left >= 0:
+        left_f.ChangeDutyCycle(clamp(left)); left_b.ChangeDutyCycle(0)
+    else:
+        left_f.ChangeDutyCycle(0); left_b.ChangeDutyCycle(clamp(-left))
+    if right >= 0:
+        right_f.ChangeDutyCycle(clamp(right)); right_b.ChangeDutyCycle(0)
+    else:
+        right_f.ChangeDutyCycle(0); right_b.ChangeDutyCycle(clamp(-right))
 
-def move_forward(speed=10):
-    """Moves the robot forward at a specified speed."""
-    GPIO.output(MOTOR_LEFT_BACKWARD, GPIO.LOW)
-    GPIO.output(MOTOR_RIGHT_BACKWARD, GPIO.LOW)
-    left_pwm.ChangeDutyCycle(speed)
-    right_pwm.ChangeDutyCycle(speed)
+def stop_motor():
+    set_motor(0, 0)
 
-def turn_left(speed=10):
-    """Turns the robot left by stopping the left motor and moving the right motor."""
-    GPIO.output(MOTOR_LEFT_BACKWARD, GPIO.LOW)
-    GPIO.output(MOTOR_RIGHT_BACKWARD, GPIO.LOW)
-    left_pwm.ChangeDutyCycle(0)
-    right_pwm.ChangeDutyCycle(speed)
+def timed_turn(direction):
+    """Pivots the robot for a fixed duration to achieve ~90 degrees."""
+    TURN_DURATION = 0.75  # <--- ADJUST THIS based on your floor/battery
+    TURN_SPEED = 35
+    print(f"Executing {direction} Turn...")
+    
+    if direction == "LEFT":
+        set_motor(-TURN_SPEED, TURN_SPEED)
+    else:
+        set_motor(TURN_SPEED, -TURN_SPEED)
+    
+    time.sleep(TURN_DURATION)
+    stop_motor()
+    time.sleep(0.5)
 
-def turn_right(speed=20):
-    """Turns the robot right by stopping the right motor and moving the left motor."""
-    GPIO.output(MOTOR_LEFT_BACKWARD, GPIO.LOW)
-    GPIO.output(MOTOR_RIGHT_BACKWARD, GPIO.LOW)
-    left_pwm.ChangeDutyCycle(speed)
-    right_pwm.ChangeDutyCycle(0)
+# ============================================================
+#    VISION PARAMS
+# ============================================================
+FRAME_WIDTH  = 320
+FRAME_HEIGHT = 240
+BASE_SPEED   = 18    # Slightly faster for responsiveness
+STEER_GAIN   = 0.18  # Sensitivity to red color position
 
-def pivot_left(speed=30):
-    """Pivots the robot left by running left motor backward and right motor forward."""
-    GPIO.output(MOTOR_LEFT_BACKWARD, GPIO.HIGH)
-    GPIO.output(MOTOR_RIGHT_FORWARD, GPIO.HIGH)
-    left_pwm.ChangeDutyCycle(speed)
-    right_pwm.ChangeDutyCycle(speed)
+# HSV Red Ranges
+lower_red1 = np.array([0, 110, 70])
+upper_red1 = np.array([8, 255, 255])
+lower_red2 = np.array([165, 110, 70])
+upper_red2 = np.array([180, 255, 255])
 
-def pivot_right(speed=30):
-    """Pivots the robot right by running left motor forward and right motor backward."""
-    GPIO.output(MOTOR_LEFT_FORWARD, GPIO.HIGH)
-    GPIO.output(MOTOR_RIGHT_BACKWARD, GPIO.HIGH)
-    left_pwm.ChangeDutyCycle(speed)
-    right_pwm.ChangeDutyCycle(speed)
+# ArUco Setup
+ARUCO_DICT = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
+ARUCO_PARAMS = cv2.aruco.DetectorParameters()
+try:
+    aruco_detector = cv2.aruco.ArucoDetector(ARUCO_DICT, ARUCO_PARAMS)
+    OLD_ARUCO = False
+except AttributeError:
+    OLD_ARUCO = True
 
+TAG_MAP = {1: "STOP", 6: "LEFT", 8: "RIGHT"}
+last_turn_time = 0
+TURN_COOLDOWN = 3.0  # Seconds to ignore tags after a turn
+
+# ============================================================
+#    MAIN LOOP
+# ============================================================
 cap = cv2.VideoCapture(0)
+cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
+cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
+time.sleep(0.5)
 
-FRAME_WIDTH = 320
-CENTER_TOLERANCE = 20
-PIVOT_THRESHOLD = 70  # Deviation after which pivoting is used
+print("Robot Online. Tracking Red + ArUco...")
 
 try:
     while True:
         ret, frame = cap.read()
-        if not ret:
-            print("Failed to grab frame.")
-            break
-
-        frame = cv2.resize(frame, (FRAME_WIDTH, 240))
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-
-        mask = cv2.inRange(gray, 210, 255)
-
-        roi = mask[160:240, :]
-
-        contours, _ = cv2.findContours(roi, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
-
-        if contours:
-            largest = max(contours, key=cv2.contourArea)
-            M = cv2.moments(largest)
-            if M['m00'] != 0:
-                cx = int(M['m10'] / M['m00'])
-                center = FRAME_WIDTH // 2
-                cv2.circle(frame, (cx, 180), 5, (0, 0, 255), -1)
-                print(f"Centroid at: {cx}")
-
-                deviation = cx - center
-
-                if deviation < -PIVOT_THRESHOLD:
-                    print("Pivoting Right (sharp correction)")
-                    pivot_left(speed=30)
-                elif deviation > PIVOT_THRESHOLD:
-                    print("Pivoting Left (sharp correction)")
-                    pivot_right(speed=30)
-                elif deviation < -CENTER_TOLERANCE:
-                    print("Turning Right (mild correction)")
-                    turn_left(speed=25)
-                elif deviation > CENTER_TOLERANCE:
-                    print("Turning Left (mild correction)")
-                    turn_right(speed=25)
-                else:
-                    print("Aligned — Moving Forward")
-                    move_forward(speed=9)
+        if not ret: break
+        
+        # --- 1. ARUCO DETECTION ---
+        action = None
+        if (time.time() - last_turn_time) > TURN_COOLDOWN:
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            if OLD_ARUCO:
+                corners, ids, _ = cv2.aruco.detectMarkers(gray, ARUCO_DICT, parameters=ARUCO_PARAMS)
             else:
-                print("No significant contour area found - Crawling ahead")
-                move_forward(speed=9)
-        else:
-            print("Lane lost — Crawling ahead")
-            move_forward(speed=9)
+                corners, ids, _ = aruco_detector.detectMarkers(gray)
+            
+            if ids is not None:
+                tid = ids[0][0] # Focus on the first detected tag
+                if tid in TAG_MAP:
+                    action = TAG_MAP[tid]
+                    cv2.aruco.drawDetectedMarkers(frame, corners, ids)
 
-        cv2.imshow("Frame", frame)
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            break
+        # --- 2. EXECUTE ARUCO ACTION ---
+        if action == "STOP":
+            print("Tag: STOP")
+            stop_motor()
+            time.sleep(2.0)
+            last_turn_time = time.time() # Trigger cooldown so it doesn't stop again immediately
+
+        elif action == "LEFT":
+            # Drive forward slightly to get into the intersection
+            set_motor(BASE_SPEED, BASE_SPEED)
+            time.sleep(0.4)
+            timed_turn("LEFT")
+            last_turn_time = time.time()
+
+        elif action == "RIGHT":
+            set_motor(BASE_SPEED, BASE_SPEED)
+            time.sleep(0.4)
+            timed_turn("RIGHT")
+            last_turn_time = time.time()
+
+        # --- 3. RED LINE FOLLOWING (Default Action) ---
+        else:
+            hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+            mask = cv2.bitwise_or(cv2.inRange(hsv, lower_red1, upper_red1), 
+                                  cv2.inRange(hsv, lower_red2, upper_red2))
+            
+            # Look at the lower half only to stay focused on the track
+            roi_mask = mask[FRAME_HEIGHT//2:, :]
+            M = cv2.moments(roi_mask)
+            
+            if M["m00"] > 500:
+                cX = int(M["m10"] / M["m00"])
+                error = cX - (FRAME_WIDTH // 2)
+                
+                steer = STEER_GAIN * error
+                # Steer toward the red blob
+                set_motor(BASE_SPEED + steer, BASE_SPEED - steer)
+                
+                # Visual Indicator
+                cv2.circle(frame, (cX, FRAME_HEIGHT - 30), 10, (0, 255, 0), -1)
+            else:
+                # No red? Drive slowly forward searching
+                set_motor(BASE_SPEED * 0.7, BASE_SPEED * 0.7)
+                cv2.putText(frame, "SEARCHING FOR RED", (50, 50), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,255), 2)
+
+        # Show the camera feed
+        cv2.imshow("Robot View", frame)
+        if cv2.waitKey(1) == ord('q'): break
 
 except KeyboardInterrupt:
-    print("Program interrupted by user.")
-
+    print("\nUser Stopped Program.")
 finally:
-    print("Stopping motors and releasing resources.")
-    stop()
-    left_pwm.stop()
-    right_pwm.stop()
+    stop_motor()
     cap.release()
     cv2.destroyAllWindows()
     GPIO.cleanup()

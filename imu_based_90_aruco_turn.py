@@ -109,9 +109,9 @@ def turn_robot(target_angle):
 FRAME_WIDTH  = 320
 FRAME_HEIGHT = 240
 
-MAX_SPEED    = 15
+MAX_SPEED    = 25
 BASE_SPEED   = int(MAX_SPEED * 1)
-STEER_GAIN   = 0.12  
+STEER_GAIN   = 0.25
 NWINDOWS     = 10    
 MARGIN       = 40    
 MINPIX       = 40    
@@ -138,7 +138,7 @@ try:
 except AttributeError:
     OLD_ARUCO = True
 
-TAG_MAP = {1: "STOP", 6: "LEFT", 8: "RIGHT"}
+TAG_MAP = {1: "RIGHT", 4: "LEFT", 8: "RIGHT",  7: "LEFT",  6: "RIGHT", 10: "LEFT", 9: "STOP"}
 
 # ============================================================
 #   MAIN LOOP
